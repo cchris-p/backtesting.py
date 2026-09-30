@@ -725,7 +725,8 @@ class Trade:
 
 class _Broker:
     def __init__(self, *, data, cash, spread, commission, margin,
-                 trade_on_close, hedging, exclusive_orders, index):
+                 trade_on_close, hedging, exclusive_orders, index,
+                 intrabar_sltp='defer'):
         assert cash > 0, f"cash should be > 0, is {cash}"
         assert 0 < margin <= 1, f"margin should be between 0 and 1, is {margin}"
         self._data: _Data = data
@@ -749,6 +750,10 @@ class _Broker:
         self._trade_on_close = trade_on_close
         self._hedging = hedging
         self._exclusive_orders = exclusive_orders
+        # Same-bar SL/TP resolution after a stop/limit entry:
+        #   'defer'       - upstream behavior: warn and defer to the next bar
+        #   'pessimistic' - resolve on the entry bar, adverse (SL) level first
+        self._intrabar_sltp = intrabar_sltp
 
         self._equity = np.tile(np.nan, len(index))
         self.orders: List[Order] = []
@@ -1036,15 +1041,29 @@ class _Broker:
                         reprocess_orders = True
                     elif (low <= (order.sl or -np.inf) <= high or
                           low <= (order.tp or -np.inf) <= high):
-                        warnings.warn(
-                            f"({data.index[-1]}) A contingent SL/TP order would execute in the "
-                            "same bar its parent stop/limit order was turned into a trade. "
-                            "Since we can't assert the precise intra-candle "
-                            "price movement, the affected SL/TP order will instead be executed on "
-                            "the next (matching) price/bar, making the result (of this trade) "
-                            "somewhat dubious. "
-                            "See https://github.com/kernc/backtesting.py/issues/119",
-                            UserWarning)
+                        if self._intrabar_sltp == 'pessimistic':
+                            # Same-bar SL/TP ambiguity after a stop/limit entry:
+                            # resolve on the entry bar instead of deferring to the
+                            # next bar. Conservative ("adverse first") convention:
+                            # if the SL is inside the bar, assume it was reached
+                            # before the TP; otherwise take the TP.
+                            new_trade = self.trades[-1]
+                            sl_hit = order.sl is not None and (
+                                low <= order.sl if order.is_long else high >= order.sl)
+                            if sl_hit:
+                                self._close_trade(new_trade, order.sl, self._i)
+                            elif order.tp is not None:
+                                self._close_trade(new_trade, order.tp, self._i)
+                        else:
+                            warnings.warn(
+                                f"({data.index[-1]}) A contingent SL/TP order would execute in the "
+                                "same bar its parent stop/limit order was turned into a trade. "
+                                "Since we can't assert the precise intra-candle "
+                                "price movement, the affected SL/TP order will instead be executed on "
+                                "the next (matching) price/bar, making the result (of this trade) "
+                                "somewhat dubious. "
+                                "See https://github.com/kernc/backtesting.py/issues/119",
+                                UserWarning)
 
             # Order processed
             self.orders.remove(order)
@@ -1204,6 +1223,7 @@ class Backtest:
                  hedging=False,
                  exclusive_orders=False,
                  finalize_trades=False,
+                 intrabar_sltp='defer',
                  ):
         if not (isinstance(strategy, type) and issubclass(strategy, Strategy)):
             raise TypeError('`strategy` must be a Strategy sub-type')
@@ -1217,6 +1237,8 @@ class Backtest:
                             'a tuple of `(fixed, relative)` commission, '
                             'or a function that takes `(order_size, price)`'
                             'and returns commission dollar value')
+        if intrabar_sltp not in ('defer', 'pessimistic'):
+            raise ValueError("`intrabar_sltp` must be 'defer' or 'pessimistic'")
 
         data = data.copy(deep=False)
 
@@ -1263,6 +1285,7 @@ class Backtest:
             _Broker, cash=cash, spread=spread, commission=commission, margin=margin,
             trade_on_close=trade_on_close, hedging=hedging,
             exclusive_orders=exclusive_orders, index=data.index,
+            intrabar_sltp=intrabar_sltp,
         )
         self._strategy = strategy
         self._results: Optional[pd.Series] = None
